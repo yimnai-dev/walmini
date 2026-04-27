@@ -734,7 +734,7 @@ func (w *WAL) ReadNext(size int, delta int) ([]string, error) {
 func (w *WAL) SeedWAL(size int) *[]error {
 	var errs []error
 	log.Println("Seeding WAL...")
-	for v := range max(DEFAULT_SEED_SIZE, size) {
+	for v := range min(DEFAULT_SEED_SIZE, size) {
 		record := fmt.Sprintf("%03d: %s", v+1, faker.Sentence())
 		err := w.Append(record)
 		if err != nil {

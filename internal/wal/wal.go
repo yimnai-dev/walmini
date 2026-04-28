@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-faker/faker/v4"
 )
@@ -33,6 +36,12 @@ type WAL struct {
 	ReadIndexExt           string
 	ReadCheckpointFilePath string
 	ReadCheckpointExt      string
+	RecordChan             chan [][]byte
+	IncomingRecordsChan    chan string
+	RecordBatch            [][]byte
+	RecordMu               sync.RWMutex
+	CollectionTimeoutChan  <-chan time.Time
+	Ctx                    context.Context
 }
 
 type WALConfig struct {
@@ -52,7 +61,14 @@ const (
 	DEFAULT_WRITE_INDEX_REF_EXT = "ref"
 	DEFAULT_READ_INDEX_REF_EXT  = "ref"
 	DEFAULT_READ_CHECKPOINT_EXT = "meta"
-	DEFAULT_SEED_SIZE           = 1000
+	DEFAULT_SEED_SIZE           = 100000
+	RECORD_BATCH_SIZE           = 20
+	// WORKER_POOL_SIZE = 1
+	// Sequential writing is mandatory for a WAL.
+	// A pool size > 1 would allow multiple goroutines to compete for file access;
+	// if a later batch finishes its I/O before an earlier one (due to OS scheduling),
+	// the log becomes corrupted and the sequence of events is lost.
+	WORKER_POOL_SIZE = 1
 )
 
 func (w *WAL) Init(config WALConfig) {
@@ -91,6 +107,9 @@ func (w *WAL) Init(config WALConfig) {
 			log.Fatalf("[WAL:SETUP]: Failed to Create Required Data Directory: %s", err)
 		}
 	}
+	w.RecordBatch = make([][]byte, 0, RECORD_BATCH_SIZE)
+	w.RecordChan = make(chan [][]byte, 100)
+	w.IncomingRecordsChan = make(chan string, 100)
 }
 
 func (w *WAL) createDataDirectories() *[]error {
@@ -419,49 +438,10 @@ func (w *WAL) createIndex() (*os.File, error) {
 	return head, nil
 }
 
-func (w *WAL) Append(record string) error {
-	formattedRecord := w.formatRecord(record)
-	formattedRecordLength := len(formattedRecord)
-	writeHead, err := w.OpenWriteHead()
-	if err != nil {
-		return err
-	}
-	defer writeHead.Close()
-	writeIndexHead, err := w.OpenWriteIndexHead()
-	if err != nil {
-		return err
-	}
-	defer writeIndexHead.Close()
+func (w *WAL) Append(writeHead *os.File, writeIndexHead *os.File, formattedRecord []byte) error {
 	stat, err := writeHead.Stat()
 	if err != nil {
 		return err
-	}
-	expectedSize := formattedRecordLength + int(stat.Size())
-	if expectedSize > w.MaxSegmentSize {
-		nextSegment, err := w.createSegment()
-		if err != nil {
-			return err
-		}
-		writeHead = nextSegment
-		updatedStat, err := writeHead.Stat()
-		if err != nil {
-			return err
-		}
-		stat = updatedStat
-		nextIndex, err := w.createIndex()
-		if err != nil {
-			return err
-		}
-		writeIndexRef, err := w.openWriteIndexRef()
-		if err != nil {
-			return err
-		}
-		nextIndexName := regexp.MustCompile(`\d{9}`).FindString(nextIndex.Name())
-		if err := writeIndexRef.Truncate(0); err != nil {
-			return err
-		}
-		writeIndexRef.WriteString(nextIndexName)
-		writeIndexHead = nextIndex
 	}
 	_, err = writeHead.Write(formattedRecord)
 	if err != nil {
@@ -482,6 +462,127 @@ func (w *WAL) Append(record string) error {
 	}
 
 	return nil
+}
+
+func (w *WAL) flushBatch() {
+	w.RecordMu.Lock()
+	if len(w.RecordBatch) == 0 {
+		w.RecordMu.Unlock()
+		return
+	}
+	batch := w.RecordBatch
+	w.RecordBatch = make([][]byte, 0, RECORD_BATCH_SIZE)
+	w.RecordMu.Unlock()
+	w.RecordChan <- batch
+}
+
+func (w *WAL) CollectIncomingRecords(record string) {
+	w.IncomingRecordsChan <- record
+}
+
+func (w *WAL) RunBatcher() {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	defer close(w.RecordChan)
+	for {
+		select {
+		case <-w.Ctx.Done():
+			fmt.Println("Stopping Batch Runner..")
+			w.flushBatch()
+			return
+		case <-timer.C:
+			if len(w.RecordBatch) > 0 {
+				w.flushBatch()
+			}
+			timer.Reset(2 * time.Second)
+		case record := <-w.IncomingRecordsChan:
+			formattedRecord := w.formatRecord(record)
+			w.RecordMu.Lock()
+			w.RecordBatch = append(w.RecordBatch, formattedRecord)
+			w.RecordMu.Unlock()
+			if len(w.RecordBatch) > RECORD_BATCH_SIZE {
+				timer.Reset(2 * time.Second)
+				w.flushBatch()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+		}
+	}
+}
+
+func (w *WAL) WorkerPool(wg *sync.WaitGroup) {
+	for range WORKER_POOL_SIZE {
+		wg.Add(1)
+		go w.WriteWorker(wg)
+	}
+}
+
+func (w *WAL) processBatch(records [][]byte) {
+	writeHead, err := w.OpenWriteHead()
+	if err != nil {
+		log.Printf("[WRITE-HEAD]: Could not open write head: %s\n", err)
+		return
+	}
+	defer writeHead.Close()
+	writeIndexHead, err := w.OpenWriteIndexHead()
+	if err != nil {
+		log.Printf("[WRITE-INDEX-HEAD]: Could not open write index head: %s\n", err)
+		return
+	}
+	defer writeIndexHead.Close()
+	stat, err := writeHead.Stat()
+	if err != nil {
+		log.Printf("[WRITE-HEAD-STAT]: Could not get write head stats: %s\n", err)
+		return
+	}
+	for _, record := range records {
+		expectedSize := len(record) + int(stat.Size())
+		if expectedSize > w.MaxSegmentSize {
+			nextSegment, err := w.createSegment()
+			if err != nil {
+				log.Printf("[SEGMENTS]: Could not create a new segment: %s\n", err)
+			}
+			writeHead = nextSegment
+			updatedStat, err := writeHead.Stat()
+			if err != nil {
+				log.Printf("[WRITE-HEAD-STAT]: Could not update write head stats: %s\n", err)
+				continue
+			}
+			stat = updatedStat
+			nextIndex, err := w.createIndex()
+			if err != nil {
+				log.Printf("[NEXT-INDEX]: Could not create next index: %s\n", err)
+				continue
+			}
+			writeIndexRef, err := w.openWriteIndexRef()
+			if err != nil {
+				log.Printf("[WRITE-INDEX-REF]: Could not open write index ref: %s\n", err)
+				continue
+			}
+			nextIndexName := regexp.MustCompile(`\d{9}`).FindString(nextIndex.Name())
+			if err := writeIndexRef.Truncate(0); err != nil {
+				log.Printf("[NEXT-INDEX-NAME]: Could not get next index name: %s\n", err)
+				continue
+			}
+			writeIndexRef.WriteString(nextIndexName)
+			writeIndexHead = nextIndex
+		}
+		err := w.Append(writeHead, writeIndexHead, record)
+		if err != nil {
+			log.Printf("[PROCESSING-ERROR]: %s\n", err)
+		}
+	}
+}
+
+func (w *WAL) WriteWorker(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for records := range w.RecordChan {
+		w.processBatch(records)
+	}
 }
 
 func (w *WAL) hasNextIndex() (int, error) {
@@ -694,10 +795,6 @@ func (w *WAL) ReadNext(size int, delta int) ([]string, error) {
 		return nil, err
 	}
 
-	if n < pageSize {
-		// Reached end of segment
-	}
-
 	offsets := make([]uint32, 0, size)
 	for i := 0; i < n; i += 4 {
 		offset := binary.LittleEndian.Uint32(indexBuf[i : i+4])
@@ -731,19 +828,11 @@ func (w *WAL) ReadNext(size int, delta int) ([]string, error) {
 	return records, nil
 }
 
-func (w *WAL) SeedWAL(size int) *[]error {
-	var errs []error
+func (w *WAL) SeedWAL(size int) {
 	log.Println("Seeding WAL...")
 	for v := range min(DEFAULT_SEED_SIZE, size) {
 		record := fmt.Sprintf("%03d: %s", v+1, faker.Sentence())
-		err := w.Append(record)
-		if err != nil {
-			errs = append(errs, err)
-		}
+		w.CollectIncomingRecords(record)
 	}
-	if len(errs) == 0 {
-		log.Println("Done Seeding WAL...")
-		return nil
-	}
-	return &errs
+	log.Println("Done seeding records")
 }

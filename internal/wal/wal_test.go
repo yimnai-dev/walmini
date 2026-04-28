@@ -22,9 +22,7 @@ func testWAL(t *testing.T, cfg WALConfig) *WAL {
 func TestAppendReadRoundTrip(t *testing.T) {
 	w := testWAL(t, WALConfig{})
 	const msg = "hello-wal"
-	if err := w.Append(msg); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
+	w.CollectIncomingRecords(msg)
 	records, err := w.ReadNext(10, 0)
 	if err != nil {
 		t.Fatalf("ReadNext: %v", err)
@@ -37,9 +35,7 @@ func TestAppendReadRoundTrip(t *testing.T) {
 func TestReadBatchesAdvanceCheckpoint(t *testing.T) {
 	w := testWAL(t, WALConfig{})
 	for _, s := range []string{"a", "b", "c", "d", "e"} {
-		if err := w.Append(s); err != nil {
-			t.Fatalf("Append: %v", err)
-		}
+		w.CollectIncomingRecords(s)
 	}
 	first, err := w.ReadNext(2, 0)
 	if err != nil {
@@ -67,9 +63,7 @@ func TestReadBatchesAdvanceCheckpoint(t *testing.T) {
 func TestSeekNonZero(t *testing.T) {
 	w := testWAL(t, WALConfig{})
 	for range 5 {
-		if err := w.Append("x"); err != nil {
-			t.Fatalf("Append: %v", err)
-		}
+		w.CollectIncomingRecords("x")
 	}
 	records, err := w.ReadNext(2, 2)
 	if err != nil {
@@ -82,9 +76,7 @@ func TestSeekNonZero(t *testing.T) {
 
 func TestSeekZeroIsError(t *testing.T) {
 	w := testWAL(t, WALConfig{})
-	if err := w.Append("a"); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
+	w.CollectIncomingRecords("a")
 	if err := w.Seek(0); err == nil {
 		t.Fatal("Seek(0) should error")
 	}
@@ -98,12 +90,8 @@ func TestRotatesToSecondSegment(t *testing.T) {
 	for i := range large {
 		large[i] = 'x'
 	}
-	if err := w.Append(string(large)); err != nil {
-		t.Fatalf("first Append: %v", err)
-	}
-	if err := w.Append("y"); err != nil {
-		t.Fatalf("second Append: %v", err)
-	}
+	w.CollectIncomingRecords(string(large))
+	w.CollectIncomingRecords("y")
 	matches, err := filepath.Glob(filepath.Join(w.FilePathPrefix, "*."+w.SegExt))
 	if err != nil {
 		t.Fatal(err)
